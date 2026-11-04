@@ -1,8 +1,28 @@
 "use client";
-import { useState } from "react";
+import { useState, type MutableRefObject } from "react";
+import type maplibregl from "maplibre-gl";
 import { QRCodeSVG } from "qrcode.react";
 
-export default function ScreenshotButton() {
+async function getMapBlob(map: maplibregl.Map): Promise<Blob> {
+  if (!map.loaded()) {
+    await new Promise<void>((r) => map.once("idle", () => r()));
+  }
+  return new Promise<Blob>((resolve, reject) => {
+    map.once("render", () => {
+      map.getCanvas().toBlob(
+        (b) => (b ? resolve(b) : reject(new Error("Could not create image"))),
+        "image/png"
+      );
+    });
+    map.triggerRepaint();
+  });
+}
+
+export default function ScreenshotButton({
+  mapRef,
+}: {
+  mapRef: MutableRefObject<maplibregl.Map | null>;
+}) {
   const [link, setLink] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -12,27 +32,10 @@ export default function ScreenshotButton() {
     setError("");
     setLink("");
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        preferCurrentTab: true,
-      } as any);
+      const map = mapRef.current;
+      if (!map) throw new Error("Map not ready");
 
-      const video = document.createElement("video");
-      video.srcObject = stream;
-      video.muted = true;
-      await video.play();
-      await new Promise((r) => requestAnimationFrame(r));
-
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d")!.drawImage(video, 0, 0);
-      stream.getTracks().forEach((t) => t.stop());
-
-      const blob = await new Promise<Blob | null>((r) =>
-        canvas.toBlob(r, "image/png")
-      );
-      if (!blob) throw new Error("Could not create image");
+      const blob = await getMapBlob(map);
 
       const body = new FormData();
       body.append("file", blob, `screenshot-${Date.now()}.png`);
@@ -50,7 +53,7 @@ export default function ScreenshotButton() {
   }
 
   return (
-    <div style={{ position: "fixed", top: 12, right: 12, zIndex: 9999 }}>
+    <div style={{ position: "fixed", top: 70, right: 12, zIndex: 9999 }}>
       <button onClick={captureAndUpload} disabled={busy}>
         {busy ? "Working..." : "Screenshot to Drive"}
       </button>

@@ -1,11 +1,15 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import * as maplibregl from "maplibre-gl";
+import { setWorkerUrl } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import MapLegend from "./MapLegend";
 import AIGuidePanel from "./AIGuidePanel";
 import { useAppSettings } from "../context/AppSettingsContext";
 import { translations } from "../translations";
+import { QRCodeSVG } from "qrcode.react";
+
+setWorkerUrl("/maplibre-gl-worker.mjs");
 
 //Type for Geoapify autocomplete features
 //We create this custom interface because when we want the inputs/outputs
@@ -41,6 +45,7 @@ interface ClosureFeature {
 
 interface MapComponentProps {
   closures?: ClosureFeature[];
+  mapInstanceRef?: React.MutableRefObject<maplibregl.Map | null>;
 }
 
 // Updates map tile label language using MapLibre setLayoutProperty
@@ -64,7 +69,7 @@ function updateMapLanguage(map: maplibregl.Map, lang: string) {
   });
 }
 
-const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
+const MapComponent: React.FC<MapComponentProps> = ({ closures = [], mapInstanceRef }) => {
   const { language } = useAppSettings();
   const t = translations[language];
 
@@ -81,6 +86,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
   const [aiDirections, setAiDirections] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [shotLink, setShotLink] = useState("");
+  const [shotBusy, setShotBusy] = useState(false);
+  const [shotError, setShotError] = useState("");
   //These are the commnads that will outfill the input and outputs of the user for locations
 
   useEffect(() => {
@@ -104,9 +112,11 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
         style: `https://maps.geoapify.com/v1/styles/osm-bright/style.json?apiKey=${apiKey}`, //Equivalent to Google 'roadmap'
         center: [position.lng, position.lat],
         zoom: 16,
+        canvasContextAttributes: { preserveDrawingBuffer: true },
       });
 
       mapContainerRef.current = map;
+      if (mapInstanceRef) mapInstanceRef.current = map;
       map.addControl(new maplibregl.NavigationControl({ showCompass: true }), "top-right");
       map.dragPan.enable(); //Gives the ability to drag across
       map.touchZoomRotate.enableRotation(); //Allows for tilt and rotation
@@ -133,6 +143,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
         mapContainerRef.current.remove();
         mapContainerRef.current = null;
       }
+      if (mapInstanceRef) mapInstanceRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -322,6 +333,29 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
     }
   }
 
+  async function captureAndUpload(map: maplibregl.Map) {
+  setShotBusy(true);
+  setShotError("");
+  setShotLink("");
+  try {
+    await waitForIdle(map); // waits for fitBounds/easeTo to finish and tiles to load
+    const blob = await canvasToBlob(map);
+
+    const body = new FormData();
+    body.append("file", blob, `route-${Date.now()}.png`);
+
+    const res = await fetch("/api/upload", { method: "POST", body });
+    const data = await res.json();
+    if (!res.ok || !data.viewUrl) throw new Error(data.error ?? "Upload failed");
+
+    setShotLink(data.viewUrl);
+  } catch (err: any) {
+    setShotError(err?.message ?? String(err));
+  } finally {
+    setShotBusy(false);
+  }
+}
+
   //Handles the route pattern of the locations
   async function handleRouting()
   {
@@ -388,6 +422,42 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
       },
     });
 
+    //Start/end points as a layer so they show up in the screenshot
+    const endpointsData = {
+      type: "FeatureCollection" as const,
+      features: [
+        {
+          type: "Feature" as const,
+          properties: { color: "#16a34a" },
+          geometry: { type: "Point" as const, coordinates: [start.lng, start.lat] },
+        },
+        {
+          type: "Feature" as const,
+          properties: { color: "#dc2626" },
+          geometry: { type: "Point" as const, coordinates: [end.lng, end.lat] },
+        },
+      ],
+    };
+
+    const endpointSrc = map.getSource("route-endpoints") as maplibregl.GeoJSONSource | undefined;
+    if (endpointSrc) {
+      endpointSrc.setData(endpointsData);
+      map.moveLayer("route-endpoints"); // keep the dots above the freshly re-added route line
+    } else {
+      map.addSource("route-endpoints", { type: "geojson", data: endpointsData });
+      map.addLayer({
+        id: "route-endpoints",
+        type: "circle",
+        source: "route-endpoints",
+        paint: {
+          "circle-radius": 8,
+          "circle-color": ["get", "color"],
+          "circle-stroke-width": 3,
+          "circle-stroke-color": "#ffffff",
+        },
+      });
+    }
+
     //rerouting — flatten coordinates if MultiLineString
     const rawCoords = routeFeature.geometry.coordinates;
     const coords: number[][] = Array.isArray(rawCoords[0]?.[0])
@@ -450,6 +520,8 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
     if (legs && legs[0]?.steps) {
       fetchAIDirections(startInput, endInput, legs[0].steps);
     }
+
+    captureAndUpload(map);
   }
 
   async function autofillInputs(query: string): Promise<GeoapifyFeature[]>
@@ -565,6 +637,59 @@ const MapComponent: React.FC<MapComponentProps> = ({ closures = [] }) => {
           setAiLoading(false);
         }}
       />
+      {(shotBusy || shotLink || shotError) && (
+        <div
+          style={{
+            position: "fixed",
+            top: "50%",
+            right: 16,
+            transform: "translateY(-50%)",
+            zIndex: 50,
+            background: "white",
+            color: "black",
+            padding: 12,
+            borderRadius: 8,
+            textAlign: "center",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
+          }}
+        >
+          {shotBusy && <div>Preparing map link...</div>}
+
+          {shotLink && (
+            <>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "center",
+                  alignItems: "center",
+                  width: "100%",
+                }}
+              >
+                <QRCodeSVG value={shotLink} size={160} marginSize={2} />
+              </div>
+
+              <div style={{ marginTop: 8 }}>
+                Scan to open this route on your phone
+              </div>
+            </>
+          )}
+
+          {shotError && <div style={{ color: "red", maxWidth: 220 }}>{shotError}</div>}
+
+          {!shotBusy && (
+            <button
+              style={{ marginTop: 8 }}
+              onClick={() => {
+                setShotLink("");
+                setShotError("");
+              }}
+            >
+              Tap to close
+            </button>
+          )}
+        </div>
+      )}
+
       <MapLegend />
     </div>
   );
@@ -587,4 +712,29 @@ function addMarker(map: maplibregl.Map,
   new maplibregl.Marker({ element: markerElement })
     .setLngLat([position.lng, position.lat])
     .addTo(map);
+}
+
+//Waits for the camera animation and tile loading to finish (with a safety timeout)
+function waitForIdle(map: maplibregl.Map, timeoutMs = 8000): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    map.once("idle", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    map.triggerRepaint(); // makes sure "idle" fires even if the map looks settled
+  });
+}
+
+//Grabs the WebGL canvas right after a fresh render
+function canvasToBlob(map: maplibregl.Map): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    map.once("render", () => {
+      map.getCanvas().toBlob(
+        (b) => (b ? resolve(b) : reject(new Error("Could not create image"))),
+        "image/png"
+      );
+    });
+    map.triggerRepaint();
+  });
 }
