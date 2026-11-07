@@ -42,3 +42,4 @@ next-env.d.ts
 
 .claude/
 backend/server.py
+backend/__pycache__/serverLLM.cpython-311.pyc
